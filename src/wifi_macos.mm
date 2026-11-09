@@ -16,30 +16,52 @@
 #include <climits>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
 
-// Delegate to observe CoreLocation authorization changes
-@interface AutoWiFiLocationDelegate : NSObject <CLLocationManagerDelegate>
+@interface AutoWiFiLocationController : NSObject <CLLocationManagerDelegate>
+@property(nonatomic, strong) CLLocationManager* manager;
 @property(nonatomic, assign) BOOL authResolved;
 @property(nonatomic, assign) CLAuthorizationStatus currentStatus;
+@property(nonatomic, copy) void (^onAuthorizedCallback)(void);
++ (instancetype)shared;
+- (void)requestPermissionInteractive:(BOOL)waitRunLoop;
 @end
 
-@implementation AutoWiFiLocationDelegate
+@implementation AutoWiFiLocationController
+
++ (instancetype)shared {
+    static AutoWiFiLocationController* s_instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_instance = [[AutoWiFiLocationController alloc] init];
+    });
+    return s_instance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _manager = [[CLLocationManager alloc] init];
+        _manager.delegate = self;
+        _currentStatus = _manager.authorizationStatus;
+        _authResolved = (_currentStatus != kCLAuthorizationStatusNotDetermined);
+    }
+    return self;
+}
+
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager*)manager {
     self.currentStatus = manager.authorizationStatus;
     if (self.currentStatus != kCLAuthorizationStatusNotDetermined) {
         self.authResolved = YES;
-    }
-}
-
-- (void)locationManager:(CLLocationManager*)manager
-    didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
-    (void)manager;
-    self.currentStatus = status;
-    if (status != kCLAuthorizationStatusNotDetermined) {
-        self.authResolved = YES;
+        [self.manager stopUpdatingLocation];
+        if ((self.currentStatus == kCLAuthorizationStatusAuthorizedAlways ||
+             self.currentStatus == kCLAuthorizationStatusAuthorized) &&
+            self.onAuthorizedCallback) {
+            self.onAuthorizedCallback();
+        }
     }
 }
 
@@ -47,6 +69,7 @@
      didUpdateLocations:(NSArray<CLLocation*>*)locations {
     (void)manager;
     (void)locations;
+    [self.manager stopUpdatingLocation];
 }
 
 - (void)locationManager:(CLLocationManager*)manager
@@ -54,56 +77,43 @@
     (void)manager;
     (void)error;
 }
+
+- (void)requestPermissionInteractive:(BOOL)waitRunLoop {
+    self.currentStatus = self.manager.authorizationStatus;
+    if (self.currentStatus == kCLAuthorizationStatusAuthorizedAlways ||
+        self.currentStatus == kCLAuthorizationStatusAuthorized) {
+        return;
+    }
+
+    if (![CLLocationManager locationServicesEnabled]) {
+        return;
+    }
+
+    if (self.currentStatus == kCLAuthorizationStatusNotDetermined) {
+        if ([self.manager respondsToSelector:@selector(requestAlwaysAuthorization)]) {
+            [self.manager requestAlwaysAuthorization];
+        }
+        if ([self.manager respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
+            [self.manager requestWhenInUseAuthorization];
+        }
+        [self.manager startUpdatingLocation];
+
+        if (waitRunLoop) {
+            NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:20.0];
+            while (!self.authResolved && [deadline timeIntervalSinceNow] > 0) {
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+            }
+            [self.manager stopUpdatingLocation];
+        }
+    }
+}
+
 @end
 
 namespace wifi {
 
 namespace {
-
-static const char* kEmbeddedInfoPlistXml =
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-    "<plist version=\"1.0\">\n"
-    "<dict>\n"
-    "    <key>CFBundleDevelopmentRegion</key>\n"
-    "    <string>zh_CN</string>\n"
-    "    <key>CFBundleExecutable</key>\n"
-    "    <string>auto-wifi</string>\n"
-    "    <key>CFBundleIdentifier</key>\n"
-    "    <string>io.github.lokmenower.autowifi</string>\n"
-    "    <key>CFBundleInfoDictionaryVersion</key>\n"
-    "    <string>6.0</string>\n"
-    "    <key>CFBundleName</key>\n"
-    "    <string>AutoWiFi</string>\n"
-    "    <key>CFBundleDisplayName</key>\n"
-    "    <string>AutoWiFi</string>\n"
-    "    <key>CFBundlePackageType</key>\n"
-    "    <string>APPL</string>\n"
-    "    <key>CFBundleShortVersionString</key>\n"
-    "    <string>1.2.0</string>\n"
-    "    <key>CFBundleVersion</key>\n"
-    "    <string>120</string>\n"
-    "    <key>LSMinimumSystemVersion</key>\n"
-    "    <string>11.0</string>\n"
-    "    <key>NSLocationUsageDescription</key>\n"
-    "    <string>AutoWiFi 需要访问位置权限以读取当前连接的 Wi-Fi 名称 (SSID) 及扫描周围无线网络（macOS 系统隐私要求）。</string>\n"
-    "    <key>NSLocationWhenInUseUsageDescription</key>\n"
-    "    <string>AutoWiFi 需要访问位置权限以读取当前连接的 Wi-Fi 名称 (SSID) 及扫描周围无线网络（macOS 系统隐私要求）。</string>\n"
-    "    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>\n"
-    "    <string>AutoWiFi 需要访问位置权限以在后台守护时检测当前连接的 Wi-Fi 名称 (SSID) 并自动重连。</string>\n"
-    "</dict>\n"
-    "</plist>\n";
-
-void MkdirRecursive(const std::string& dir) {
-    std::string cur;
-    for (size_t i = 0; i < dir.size(); ++i) {
-        cur.push_back(dir[i]);
-        if (dir[i] == '/' && cur.size() > 1) {
-            mkdir(cur.c_str(), 0755);
-        }
-    }
-    mkdir(dir.c_str(), 0755);
-}
 
 int RssiToQuality(NSInteger rssi) {
     if (rssi == 0) return 0;
@@ -137,177 +147,46 @@ std::wstring DescribeSecurity(CWNetwork* net, bool& out_secure, bool& out_8021x)
     return L"加密网络";
 }
 
-// Request macOS Location Services authorization via CoreLocation so CoreWLAN can read real SSIDs
-void RequestLocationAuthorizationOnMainThread() {
-    static bool s_checked_once = false;
-    static bool s_denied_prompted = false;
-
-    @autoreleasepool {
-        [NSApplication sharedApplication];
-
-        CLLocationManager* manager = [[CLLocationManager alloc] init];
-        AutoWiFiLocationDelegate* delegate = [[AutoWiFiLocationDelegate alloc] init];
-        manager.delegate = delegate;
-
-        CLAuthorizationStatus status = manager.authorizationStatus;
-
-        if (status == kCLAuthorizationStatusAuthorizedAlways || status == kCLAuthorizationStatusAuthorized) {
-            return;
-        }
-
-        if (![CLLocationManager locationServicesEnabled]) {
-            if (!s_checked_once) {
-                s_checked_once = true;
-                std::cout << utils::WideToUtf8(utils::CurrentTimeStr())
-                          << " [权限] macOS 系统全局「定位服务」处于关闭状态，无法读取 Wi-Fi SSID。\n";
-            }
-            return;
-        }
-
-        if (status == kCLAuthorizationStatusNotDetermined) {
-            // Switch to Regular activation policy briefly so macOS WindowServer brings the authorization dialog to front
-            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-            [NSApp activateIgnoringOtherApps:YES];
-
-            std::cout << utils::WideToUtf8(utils::CurrentTimeStr())
-                      << " [权限] 正在向 macOS 申请「定位服务」权限（用于读取 Wi-Fi SSID 与扫描热点），请在弹出的系统对话框中点击「允许」..."
-                      << std::endl;
-
-            if ([manager respondsToSelector:@selector(requestAlwaysAuthorization)]) {
-                [manager requestAlwaysAuthorization];
-            }
-            if ([manager respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
-                [manager requestWhenInUseAuthorization];
-            }
-            [manager startUpdatingLocation];
-
-            // Pump NSRunLoop for up to 25 seconds while waiting for the user to click Allow/Don't Allow
-            NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:25.0];
-            while (!delegate.authResolved && [deadline timeIntervalSinceNow] > 0) {
-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
-            }
-
-            [manager stopUpdatingLocation];
-            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-
-            status = manager.authorizationStatus;
-
-            if (status == kCLAuthorizationStatusAuthorizedAlways || status == kCLAuthorizationStatusAuthorized) {
-                std::cout << utils::WideToUtf8(utils::CurrentTimeStr())
-                          << " [权限] 已获得 macOS 定位与 Wi-Fi 信息访问授权！" << std::endl;
-                return;
-            }
-        }
-
-        if ((status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted) && !s_denied_prompted) {
-            s_denied_prompted = true;
-            std::cout << utils::WideToUtf8(utils::CurrentTimeStr())
-                      << " [权限] 尚未授予 AutoWiFi 定位权限（macOS 会将 SSID 隐藏为 <redacted>）。\n"
-                      << "       请在「系统设置 -> 隐私与安全性 -> 定位服务」中开启 AutoWiFi（或当前终端）权限。" << std::endl;
-            // Open Location Services settings pane once to help user grant permission easily
-            [[NSWorkspace sharedWorkspace]
-                openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"]];
-        }
-        s_checked_once = true;
-    }
-}
-
-void EnsureLocationAuthorization() {
-    if ([NSThread isMainThread]) {
-        RequestLocationAuthorizationOnMainThread();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            RequestLocationAuthorizationOnMainThread();
-        });
-    }
-}
-
 }  // namespace
 
-// Ensure the process runs from inside an .app bundle on macOS so locationd shows the authorization dialog
-void EnsureMacAppBundleContext(int argc, char* argv[]) {
-    if (std::getenv("AUTOWIFI_NO_REEXEC") != nullptr) {
-        return;
-    }
-
-    char exe_buf[PATH_MAX] = {0};
-    uint32_t sz = sizeof(exe_buf);
-    if (_NSGetExecutablePath(exe_buf, &sz) != 0) {
-        return;
-    }
-    char real_buf[PATH_MAX] = {0};
-    std::string exe_path = realpath(exe_buf, real_buf) ? real_buf : exe_buf;
-
-    // Already running inside *.app/Contents/MacOS/*
-    if (exe_path.find(".app/Contents/MacOS/") != std::string::npos) {
-        return;
-    }
-
-    // Preserve original executable path for config.cpp portable config lookup and LaunchAgent registration
-    setenv("AUTOWIFI_ORIGINAL_EXE", exe_path.c_str(), 1);
-    setenv("AUTOWIFI_NO_REEXEC", "1", 1);
-
-    // Check if AutoWiFi.app exists alongside the executable first
-    size_t slash = exe_path.find_last_of('/');
-    if (slash != std::string::npos) {
-        std::string sibling_app_bin = exe_path.substr(0, slash + 1) + "AutoWiFi.app/Contents/MacOS/auto-wifi";
-        struct stat st_sib{};
-        if (stat(sibling_app_bin.c_str(), &st_sib) == 0 && (st_sib.st_mode & S_IXUSR)) {
-            execv(sibling_app_bin.c_str(), argv);
+void RequestMacLocationPermission(std::function<void()> on_authorized, bool wait_if_cli) {
+    auto block = ^() {
+        AutoWiFiLocationController* ctrl = [AutoWiFiLocationController shared];
+        if (on_authorized) {
+            ctrl.onAuthorizedCallback = ^{
+                on_authorized();
+            };
         }
+        [ctrl requestPermissionInteractive:(wait_if_cli ? YES : NO)];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
     }
+}
 
-    // Otherwise create or update ~/.cache/auto-wifi/AutoWiFi.app bundle wrapper on the fly
-    const char* home = std::getenv("HOME");
-    if (!home || !home[0]) return;
-
-    std::string app_dir = std::string(home) + "/.cache/auto-wifi/AutoWiFi.app";
-    std::string contents_dir = app_dir + "/Contents";
-    std::string macos_dir = contents_dir + "/MacOS";
-    std::string plist_path = contents_dir + "/Info.plist";
-    std::string bundled_bin = macos_dir + "/auto-wifi";
-
-    MkdirRecursive(macos_dir);
-
-    bool need_update = false;
-    struct stat st_src{}, st_dst{};
-    if (stat(exe_path.c_str(), &st_src) == 0) {
-        if (stat(bundled_bin.c_str(), &st_dst) != 0 ||
-            st_src.st_mtime != st_dst.st_mtime ||
-            st_src.st_size != st_dst.st_size) {
-            need_update = true;
-        }
+bool IsMacLocationPermissionDenied() {
+    __block CLAuthorizationStatus st = kCLAuthorizationStatusNotDetermined;
+    if ([NSThread isMainThread]) {
+        st = [AutoWiFiLocationController shared].manager.authorizationStatus;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            st = [AutoWiFiLocationController shared].manager.authorizationStatus;
+        });
     }
+    return (st == kCLAuthorizationStatusDenied || st == kCLAuthorizationStatusRestricted);
+}
 
-    if (need_update) {
-        std::ofstream plist_ofs(plist_path, std::ios::trunc);
-        if (plist_ofs.is_open()) {
-            plist_ofs << kEmbeddedInfoPlistXml;
-            plist_ofs.close();
-        }
-
-        std::ifstream src(exe_path, std::ios::binary);
-        std::ofstream dst(bundled_bin, std::ios::binary | std::ios::trunc);
-        if (src.is_open() && dst.is_open()) {
-            dst << src.rdbuf();
-            dst.close();
-            chmod(bundled_bin.c_str(), 0755);
-            // Ad-hoc sign the app bundle so macOS locationd accepts it
-            utils::RunCommand("codesign --force --deep --sign - " + utils::ShellEscape(app_dir));
-        }
-    }
-
-    struct stat st_check{};
-    if (stat(bundled_bin.c_str(), &st_check) == 0 && (st_check.st_mode & S_IXUSR)) {
-        (void)argc;
-        execv(bundled_bin.c_str(), argv);
-    }
+void OpenMacLocationSettings() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSWorkspace sharedWorkspace]
+            openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"]];
+    });
 }
 
 WifiConnectionState GetConnectionState() {
-    EnsureLocationAuthorization();
-
     WifiConnectionState state;
     @autoreleasepool {
         CWWiFiClient* client = [CWWiFiClient sharedWiFiClient];
@@ -331,7 +210,7 @@ WifiConnectionState GetConnectionState() {
             return state;
         }
 
-        // If connected to a network but location permission was denied (ssid is nil while rssiValue != 0)
+        // Connected to a Wi-Fi network, check if SSID is available via networksetup or redacted
         if (iface.rssiValue != 0 || iface.transmitRate > 0) {
             state.is_connected = true;
             state.signal_quality = RssiToQuality(iface.rssiValue);
@@ -347,15 +226,13 @@ WifiConnectionState GetConnectionState() {
                     return state;
                 }
             }
-            state.current_ssid = L"<未授权读取SSID>";
+            state.current_ssid = L"<需授予位置权限以显示SSID>";
         }
     }
     return state;
 }
 
 std::vector<WifiNetworkInfo> ScanNetworks(bool /*trigger_active_scan*/) {
-    EnsureLocationAuthorization();
-
     std::vector<WifiNetworkInfo> results;
     std::map<std::wstring, WifiNetworkInfo> best_by_ssid;
 
@@ -406,8 +283,6 @@ bool ConnectEnterprise8021X(const std::wstring& ssid,
         return false;
     }
 
-    EnsureLocationAuthorization();
-
     @autoreleasepool {
         CWWiFiClient* client = [CWWiFiClient sharedWiFiClient];
         CWInterface* iface = [client interface];
@@ -448,7 +323,7 @@ bool ConnectEnterprise8021X(const std::wstring& ssid,
         }
     }
 
-    out_message = L"未在周围扫描到目标 802.1X 热点 [" + ssid + L"]（请确认定位权限已允许且热点在信号范围内）";
+    out_message = L"未在周围扫描到目标 802.1X 热点 [" + ssid + L"]（请确认已允许位置权限且热点在信号范围内）";
     return false;
 }
 
@@ -460,8 +335,6 @@ bool ConnectOpenOrPsk(const std::wstring& ssid,
         out_message = L"SSID 不能为空";
         return false;
     }
-
-    EnsureLocationAuthorization();
 
     @autoreleasepool {
         CWWiFiClient* client = [CWWiFiClient sharedWiFiClient];

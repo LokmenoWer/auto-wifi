@@ -10,7 +10,7 @@
 | :--- | :--- | :--- | :--- |
 | **无线网卡控制 & 802.1X** | Native Wifi API (`wlanapi` + `EapHost`) | 原生 `CoreWLAN.framework` + `CoreLocation.framework`（自动弹窗申请定位/SSID 权限） | NetworkManager (`nmcli` 802-1x PEAP) |
 | **Captive Portal 认证** | 原生 `WinHTTP` | `libcurl` (`curl` CLI 兜底) | `libcurl` (`curl` CLI 兜底) |
-| **界面与交互模式** | Win32 原生 GUI + 系统托盘 + CLI | 交互式 TUI 终端菜单 + Daemon + CLI | 交互式 TUI 终端菜单 + Daemon + CLI |
+| **界面与交互模式** | Win32 原生 GUI + 系统托盘 + CLI | Cocoa 原生 GUI (`AutoWiFi.app`) + 顶部菜单栏托盘 + CLI | 交互式 TUI 终端菜单 + Daemon + CLI |
 | **凭据安全存储** | Windows DPAPI (`CryptProtectData`) | 本地用户盐值流加密 (`0600` 权限) | 本地用户盐值流加密 (`0600` 权限) |
 | **开机自动启动** | 注册表 `HKCU\...\Run` | LaunchAgent (`~/Library/LaunchAgents`) | XDG Autostart (`~/.config/autostart`) |
 
@@ -38,7 +38,20 @@
 - `auto-wifi.exe --minimized`（或 `--tray` / `--daemon` / `-m` / `-d`）：启动后直接最小化到系统托盘后台运行。
 - `auto-wifi.exe --connect-once`（或 `-c`）：读取配置执行一次连接与认证后立即退出。
 
-### macOS / Linux (`auto-wifi`)
+### macOS (`AutoWiFi.app` / `auto-wifi`)
+- **图形界面启动**：直接双击运行 `dist/AutoWiFi.app`（或在终端执行 `open dist/AutoWiFi.app`），启动原生 Cocoa 图形界面并常驻顶部菜单栏。
+  - > **注意（浏览器下载后无法打开的解决方法）**：从 GitHub Releases 下载的未公证应用会被 macOS Gatekeeper 附加隔离属性（提示“未打开 AutoWiFi”或“已损坏”）。请在终端执行以下命令解除隔离后再双击打开：
+  - > ```bash
+  - > xattr -cr AutoWiFi.app
+  - > open AutoWiFi.app
+  - > ```
+- `./auto-wifi --minimized`（或 `-m` / `-d`）：启动后仅驻留顶部菜单栏后台运行。
+- `./auto-wifi --connect-once`（或 `-c`）：立即执行一次连接与认证后退出。
+- `./auto-wifi --status`（或 `-s`）：检测当前无线连接与互联网/Portal 状态。
+- `./auto-wifi --scan`：扫描并列出周围 Wi-Fi 网络。
+- `./auto-wifi --help`（或 `-h`）：显示帮助信息。
+
+### Linux (`auto-wifi`)
 - `./auto-wifi`：启动交互式终端控制菜单（TUI）。
 - `./auto-wifi --daemon`（或 `-d` / `-m`）：启动后台断线自动重连守护进程。
 - `./auto-wifi --connect-once`（或 `-c`）：立即执行一次连接与认证后退出。
@@ -46,7 +59,6 @@
 - `./auto-wifi --scan`：扫描并列出周围 Wi-Fi 网络。
 - `./auto-wifi --config`：运行交互式账号密码与 Portal 配置向导。
 - `./auto-wifi --disconnect`：断开当前 Wi-Fi 连接。
-- `./auto-wifi --help`（或 `-h`）：显示帮助信息。
 
 ## 编译指南
 

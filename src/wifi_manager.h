@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -44,8 +45,9 @@ bool ConnectOpenOrPsk(const std::wstring& ssid,
 bool Disconnect(std::wstring& out_message);
 
 #ifdef __APPLE__
-// Ensure macOS process runs within an .app bundle context so CoreLocation can prompt for permission
-void EnsureMacAppBundleContext(int argc, char* argv[]);
+void RequestMacLocationPermission(std::function<void()> on_authorized = nullptr, bool wait_if_cli = false);
+bool IsMacLocationPermissionDenied();
+void OpenMacLocationSettings();
 #endif
 
 }  // namespace wifi

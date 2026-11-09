@@ -828,7 +828,7 @@ int RunConnectOnceCli() {
     return ok ? 0 : 1;
 }
 
-#else  // POSIX (macOS / Linux) CLI, TUI & Daemon implementation
+#elif !defined(__APPLE__)  // Linux CLI, TUI & Daemon implementation
 
 namespace {
 
