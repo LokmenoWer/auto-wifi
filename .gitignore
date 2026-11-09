@@ -1,0 +1,15 @@
+# Build directory
+build/
+cmake-build-*/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local user config with credentials
+config.ini
+dist/config.ini
