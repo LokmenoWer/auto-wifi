@@ -43,4 +43,9 @@ bool ConnectOpenOrPsk(const std::wstring& ssid,
 // Disconnect current Wi-Fi
 bool Disconnect(std::wstring& out_message);
 
+#ifdef __APPLE__
+// Ensure macOS process runs within an .app bundle context so CoreLocation can prompt for permission
+void EnsureMacAppBundleContext(int argc, char* argv[]);
+#endif
+
 }  // namespace wifi

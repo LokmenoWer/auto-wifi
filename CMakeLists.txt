@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(AutoWiFi VERSION 1.1.0 LANGUAGES CXX)
+project(AutoWiFi VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,12 +37,31 @@ if(WIN32)
         user32
     )
 else()
+    if(APPLE)
+        enable_language(OBJCXX)
+        set(CMAKE_OBJCXX_STANDARD 17)
+        set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+        list(APPEND SOURCES src/wifi_macos.mm)
+    endif()
+
     add_executable(auto-wifi ${SOURCES})
     target_include_directories(auto-wifi PRIVATE src res)
     target_compile_options(auto-wifi PRIVATE -Wall -Wextra -O2)
 
     find_package(Threads REQUIRED)
     target_link_libraries(auto-wifi PRIVATE Threads::Threads)
+
+    if(APPLE)
+        target_link_libraries(auto-wifi PRIVATE
+            "-framework Foundation"
+            "-framework CoreWLAN"
+            "-framework CoreLocation"
+            "-framework AppKit"
+        )
+        target_link_options(auto-wifi PRIVATE
+            "-Wl,-sectcreate,__TEXT,__info_plist,${CMAKE_SOURCE_DIR}/res/Info.plist"
+        )
+    endif()
 
     find_package(CURL QUIET)
     if(CURL_FOUND)

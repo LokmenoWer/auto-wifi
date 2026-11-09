@@ -8,7 +8,7 @@
 
 | 功能模块 | Windows (x64) | macOS (Apple Silicon / Intel) | Linux (x64 / ARM64) |
 | :--- | :--- | :--- | :--- |
-| **无线网卡控制 & 802.1X** | Native Wifi API (`wlanapi` + `EapHost`) | `networksetup` / `ipconfig` / `.mobileconfig` | NetworkManager (`nmcli` 802-1x PEAP) |
+| **无线网卡控制 & 802.1X** | Native Wifi API (`wlanapi` + `EapHost`) | 原生 `CoreWLAN.framework` + `CoreLocation.framework`（自动弹窗申请定位/SSID 权限） | NetworkManager (`nmcli` 802-1x PEAP) |
 | **Captive Portal 认证** | 原生 `WinHTTP` | `libcurl` (`curl` CLI 兜底) | `libcurl` (`curl` CLI 兜底) |
 | **界面与交互模式** | Win32 原生 GUI + 系统托盘 + CLI | 交互式 TUI 终端菜单 + Daemon + CLI | 交互式 TUI 终端菜单 + Daemon + CLI |
 | **凭据安全存储** | Windows DPAPI (`CryptProtectData`) | 本地用户盐值流加密 (`0600` 权限) | 本地用户盐值流加密 (`0600` 权限) |

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>auto-wifi</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.lokmenower.autowifi</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>AutoWiFi</string>
+    <key>CFBundleDisplayName</key>
+    <string>AutoWiFi</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.0</string>
+    <key>CFBundleVersion</key>
+    <string>120</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSLocationUsageDescription</key>
+    <string>AutoWiFi 需要访问位置权限以读取当前连接的 Wi-Fi 名称 (SSID) 及扫描周围无线网络（macOS 系统隐私要求）。</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>AutoWiFi 需要访问位置权限以读取当前连接的 Wi-Fi 名称 (SSID) 及扫描周围无线网络（macOS 系统隐私要求）。</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>AutoWiFi 需要访问位置权限以在后台守护时检测当前连接的 Wi-Fi 名称 (SSID) 并自动重连。</string>
+</dict>
+</plist>

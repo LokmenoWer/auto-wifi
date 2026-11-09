@@ -66,6 +66,10 @@ static int ReadIniInt(const std::wstring& path, const wchar_t* key, int def_val)
 #else  // POSIX (macOS / Linux)
 
 static std::string GetExecutablePathPosix() {
+    const char* orig_exe = std::getenv("AUTOWIFI_ORIGINAL_EXE");
+    if (orig_exe && orig_exe[0] != '\0') {
+        return orig_exe;
+    }
 #ifdef __APPLE__
     char buf[PATH_MAX] = {0};
     uint32_t size = sizeof(buf);

@@ -55,7 +55,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
 
 #else
 
+#ifdef __APPLE__
+#include "wifi_manager.h"
+#include <cstring>
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef __APPLE__
+    bool is_help = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            is_help = true;
+            break;
+        }
+    }
+    if (!is_help) {
+        wifi::EnsureMacAppBundleContext(argc, argv);
+    }
+#endif
     return RunPosixApp(argc, argv);
 }
 

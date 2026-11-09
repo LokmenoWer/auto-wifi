@@ -12,6 +12,15 @@ build_native() {
     cmake -B build-native -DCMAKE_BUILD_TYPE=Release
     cmake --build build-native -j4
     cp -f build-native/auto-wifi dist/auto-wifi
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        mkdir -p dist/AutoWiFi.app/Contents/MacOS
+        cp -f res/Info.plist dist/AutoWiFi.app/Contents/Info.plist
+        cp -f build-native/auto-wifi dist/AutoWiFi.app/Contents/MacOS/auto-wifi
+        codesign --force --deep --sign - dist/AutoWiFi.app 2>/dev/null || true
+        codesign --force --sign - dist/auto-wifi 2>/dev/null || true
+    fi
+
     echo "Native build complete: dist/auto-wifi"
     ls -lh dist/auto-wifi
 }
