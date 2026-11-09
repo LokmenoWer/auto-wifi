@@ -3,10 +3,15 @@
 #include "portal_auth.h"
 #include "utils.h"
 #include "wifi_manager.h"
-#include "../res/resource.h"
 
+#ifdef _WIN32
+#include "../res/resource.h"
 #include <commctrl.h>
 #include <shellapi.h>
+#else
+#include <csignal>
+#include <iostream>
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -14,6 +19,8 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
 
 namespace {
 
@@ -820,3 +827,342 @@ int RunConnectOnceCli() {
     bool ok = ExecuteConnectAndAuth(cfg, false);
     return ok ? 0 : 1;
 }
+
+#else  // POSIX (macOS / Linux) CLI, TUI & Daemon implementation
+
+namespace {
+
+std::atomic<bool> g_posix_running{true};
+
+void PosixSignalHandler(int /*sig*/) {
+    g_posix_running = false;
+}
+
+void PrintLog(const std::wstring& msg) {
+    std::cout << utils::WideToUtf8(utils::CurrentTimeStr()) << " "
+              << utils::WideToUtf8(msg) << std::endl;
+}
+
+const char* AuthModeName(AuthMode mode) {
+    switch (mode) {
+        case AuthMode::WPA2_ENT_PEAP:   return "0: 802.1X 企业认证 (PEAP-MSCHAPv2)";
+        case AuthMode::PORTAL_OPEN:     return "1: 开放热点 + 网页 Captive Portal";
+        case AuthMode::PORTAL_PSK:      return "2: WPA2-PSK 密码连接 + 网页 Captive Portal";
+        case AuthMode::ENT_PLUS_PORTAL: return "3: 双重认证 (802.1X + 网页 Portal)";
+        default:                        return "未知";
+    }
+}
+
+const char* PortalMethodName(PortalMethod method) {
+    switch (method) {
+        case PortalMethod::POST_FORM: return "0: POST 表单 (urlencoded)";
+        case PortalMethod::POST_JSON: return "1: POST JSON";
+        case PortalMethod::GET_QUERY: return "2: GET 查询参数";
+        default:                      return "未知";
+    }
+}
+
+bool ExecutePosixConnectAndAuth(const AppConfig& cfg, bool is_auto_check) {
+    if (cfg.ssid.empty()) {
+        if (!is_auto_check) PrintLog(L"[错误] 未配置目标 Wi-Fi (SSID)，请先运行 --config 或在菜单中配置");
+        return false;
+    }
+
+    WifiConnectionState wifi_st = wifi::GetConnectionState();
+    bool already_on_ssid = (wifi_st.is_connected && wifi_st.current_ssid == cfg.ssid);
+
+    std::wstring redirect_url;
+    if (already_on_ssid) {
+        NetStatus net = portal::CheckInternetState(redirect_url);
+        if (net == NetStatus::ONLINE) {
+            if (!is_auto_check) {
+                PrintLog(L"[正常] 当前已连接至 [" + cfg.ssid + L"] 且外网访问正常");
+            }
+            return true;
+        }
+        if (is_auto_check) {
+            PrintLog(L"[检测] 热点 [" + cfg.ssid + L"] 已关联，但外网未认证或掉线，开始自动认证...");
+        }
+    } else {
+        PrintLog(L"[连接] 正在发起 Wi-Fi 连接: [" + cfg.ssid + L"]");
+        std::wstring wifi_msg;
+        bool wifi_ok = false;
+        if (cfg.auth_mode == AuthMode::WPA2_ENT_PEAP || cfg.auth_mode == AuthMode::ENT_PLUS_PORTAL) {
+            wifi_ok = wifi::ConnectEnterprise8021X(cfg.ssid, cfg.username, cfg.password,
+                                                   cfg.domain_or_psk, wifi_msg);
+        } else if (cfg.auth_mode == AuthMode::PORTAL_OPEN) {
+            wifi_ok = wifi::ConnectOpenOrPsk(cfg.ssid, L"", true, wifi_msg);
+        } else if (cfg.auth_mode == AuthMode::PORTAL_PSK) {
+            wifi_ok = wifi::ConnectOpenOrPsk(cfg.ssid, cfg.domain_or_psk, false, wifi_msg);
+        }
+
+        PrintLog(std::wstring(wifi_ok ? L"[成功] " : L"[失败] ") + wifi_msg);
+        if (!wifi_ok) return false;
+    }
+
+    bool need_portal = (cfg.auth_mode == AuthMode::PORTAL_OPEN ||
+                        cfg.auth_mode == AuthMode::PORTAL_PSK ||
+                        cfg.auth_mode == AuthMode::ENT_PLUS_PORTAL);
+
+    NetStatus net_after = portal::CheckInternetState(redirect_url);
+    if (net_after == NetStatus::ONLINE && (!need_portal || cfg.portal_url.empty())) {
+        PrintLog(L"[完成] 互联网已连通，无需额外网页认证");
+        return true;
+    }
+
+    if (need_portal || net_after == NetStatus::CAPTIVE_PORTAL) {
+        if (!redirect_url.empty()) {
+            PrintLog(L"[探测] 检测到 Captive Portal 重定向地址: " + redirect_url);
+        }
+        PrintLog(L"[认证] 正在以账号 [" + cfg.username + L"] 登录网页 Portal...");
+        std::wstring portal_msg;
+        bool portal_ok = portal::LoginCaptivePortal(cfg, redirect_url, portal_msg);
+        PrintLog(std::wstring(portal_ok ? L"[成功] " : L"[提示] ") + portal_msg);
+        return portal_ok;
+    }
+
+    return true;
+}
+
+void PrintNetworkStatus() {
+    WifiConnectionState st = wifi::GetConnectionState();
+    if (!st.has_adapter) {
+        PrintLog(L"[状态] 未检测到无线网卡接口");
+        return;
+    }
+    if (!st.is_connected) {
+        PrintLog(L"[状态] 无线网卡 [" + st.adapter_name + L"] 当前未连接任何 Wi-Fi");
+        return;
+    }
+    std::wstring redirect_url;
+    NetStatus net = portal::CheckInternetState(redirect_url);
+    if (net == NetStatus::ONLINE) {
+        PrintLog(L"[状态] 已连接 [" + st.current_ssid + L"] (网卡 " + st.adapter_name +
+                 L", 信号 " + std::to_wstring(st.signal_quality) + L"%) | 互联网访问正常");
+    } else if (net == NetStatus::CAPTIVE_PORTAL) {
+        PrintLog(L"[状态] 已连接 [" + st.current_ssid + L"] | 需要网页 Portal 认证 (重定向: " +
+                 (redirect_url.empty() ? L"未知" : redirect_url) + L")");
+    } else {
+        PrintLog(L"[状态] 已连接 [" + st.current_ssid + L"] | 无法访问外网");
+    }
+}
+
+void PrintScanResults() {
+    PrintLog(L"[扫描] 正在扫描周围无线网络...");
+    auto list = wifi::ScanNetworks(true);
+    std::cout << "------------------------------------------------------------\n";
+    std::cout << "序号 | 信号  | 加密/认证类型         | SSID\n";
+    std::cout << "------------------------------------------------------------\n";
+    for (size_t i = 0; i < list.size(); ++i) {
+        std::cout << " " << (i + 1) << "\t" << list[i].signal_quality << "%\t"
+                  << utils::WideToUtf8(list[i].auth_desc) << "\t\t"
+                  << utils::WideToUtf8(list[i].ssid) << "\n";
+    }
+    if (list.empty()) {
+        std::cout << " (未扫描到无线网络或需要系统定位/Wi-Fi权限)\n";
+    }
+    std::cout << "------------------------------------------------------------\n";
+}
+
+std::wstring PromptLine(const std::string& prompt, const std::wstring& default_val) {
+    std::string def_utf8 = utils::WideToUtf8(default_val);
+    std::cout << prompt;
+    if (!def_utf8.empty()) {
+        std::cout << " [" << def_utf8 << "]";
+    }
+    std::cout << ": " << std::flush;
+    std::string line;
+    if (!std::getline(std::cin, line)) return default_val;
+    line = utils::TrimUtf8(line);
+    if (line.empty()) return default_val;
+    return utils::Utf8ToWide(line);
+}
+
+void RunInteractiveConfigWizard(AppConfig& cfg) {
+    std::cout << "\n=== AutoWiFi 配置向导 (" << utils::WideToUtf8(config::GetConfigFilePath()) << ") ===\n";
+    cfg.ssid = PromptLine("目标 Wi-Fi 名称 (SSID)", cfg.ssid);
+
+    std::cout << "认证模式选项:\n"
+              << "  0 = 802.1X 企业认证 (PEAP-MSCHAPv2)\n"
+              << "  1 = 开放热点 + 网页 Captive Portal\n"
+              << "  2 = WPA2-PSK 密码连接 + 网页 Captive Portal\n"
+              << "  3 = 双重认证 (802.1X + 网页 Portal)\n";
+    std::wstring mode_str = PromptLine("选择认证模式 (0-3)", std::to_wstring(static_cast<int>(cfg.auth_mode)));
+    try {
+        int m = std::stoi(utils::WideToUtf8(mode_str));
+        if (m >= 0 && m <= 3) cfg.auth_mode = static_cast<AuthMode>(m);
+    } catch (...) {}
+
+    cfg.username = PromptLine("登录账号 (Username)", cfg.username);
+    cfg.password = PromptLine("登录密码 (Password，直接回车保持不变)", cfg.password);
+
+    if (cfg.auth_mode == AuthMode::PORTAL_PSK) {
+        cfg.domain_or_psk = PromptLine("Wi-Fi 预共享密钥 (WPA2-PSK)", cfg.domain_or_psk);
+    } else if (cfg.auth_mode != AuthMode::PORTAL_OPEN) {
+        cfg.domain_or_psk = PromptLine("802.1X 认证域 (选填，直接回车跳过)", cfg.domain_or_psk);
+    }
+
+    if (cfg.auth_mode != AuthMode::WPA2_ENT_PEAP) {
+        cfg.portal_url = PromptLine("Portal 登录 URL (留空自动探测重定向)", cfg.portal_url);
+        std::wstring pm_str = PromptLine("HTTP 提交方式 (0=POST表单, 1=POST JSON, 2=GET参数)",
+                                         std::to_wstring(static_cast<int>(cfg.portal_method)));
+        try {
+            int pm = std::stoi(utils::WideToUtf8(pm_str));
+            if (pm >= 0 && pm <= 2) cfg.portal_method = static_cast<PortalMethod>(pm);
+        } catch (...) {}
+        cfg.portal_user_field = PromptLine("Portal 账号字段名", cfg.portal_user_field);
+        cfg.portal_pass_field = PromptLine("Portal 密码字段名", cfg.portal_pass_field);
+        cfg.portal_extra_params = PromptLine("附加请求参数 (如 ac_id=1)", cfg.portal_extra_params);
+    }
+
+    std::wstring interval_s = PromptLine("后台断线检测间隔(秒)", std::to_wstring(cfg.check_interval_sec));
+    try {
+        cfg.check_interval_sec = std::clamp(std::stoi(utils::WideToUtf8(interval_s)), 3, 3600);
+    } catch (...) {}
+
+    config::SaveConfig(cfg);
+    PrintLog(L"[保存] 配置已加密保存至: " + config::GetConfigFilePath());
+}
+
+int RunDaemonLoop() {
+    std::signal(SIGINT, PosixSignalHandler);
+    std::signal(SIGTERM, PosixSignalHandler);
+
+    AppConfig cfg = config::LoadConfig();
+    PrintLog(L"[守护] AutoWiFi 后台守护进程已启动 (按 Ctrl+C 停止)");
+    PrintLog(L"[配置] 配置文件: " + config::GetConfigFilePath());
+
+    if (!cfg.ssid.empty()) {
+        ExecutePosixConnectAndAuth(cfg, false);
+    }
+
+    while (g_posix_running) {
+        cfg = config::LoadConfig();
+        int wait_sec = std::max(3, cfg.check_interval_sec);
+        for (int i = 0; i < wait_sec * 5 && g_posix_running; ++i) {
+            utils::SleepMs(200);
+        }
+        if (!g_posix_running) break;
+        if (cfg.auto_connect && !cfg.ssid.empty()) {
+            ExecutePosixConnectAndAuth(cfg, true);
+        }
+    }
+
+    PrintLog(L"[退出] AutoWiFi 守护进程已停止");
+    return 0;
+}
+
+void PrintUsage(const char* prog) {
+    std::cout << "AutoWiFi - 跨平台自动认证 Wi-Fi 客户端 (Windows / macOS / Linux)\n\n"
+              << "用法:\n"
+              << "  " << prog << "                  启动交互式终端控制菜单\n"
+              << "  " << prog << " --daemon (-d/-m) 启动后台断线自动重连守护进程\n"
+              << "  " << prog << " --connect-once (-c) 立即执行一次连接与认证后退出\n"
+              << "  " << prog << " --status (-s)    检测当前无线连接与互联网/Portal状态\n"
+              << "  " << prog << " --scan           扫描并列出周围 Wi-Fi 网络\n"
+              << "  " << prog << " --config         运行交互式账号密码与 Portal 配置向导\n"
+              << "  " << prog << " --disconnect     断开当前 Wi-Fi 连接\n"
+              << "  " << prog << " --help (-h)      显示此帮助信息\n";
+}
+
+}  // namespace
+
+int RunConnectOnceCli() {
+    AppConfig cfg = config::LoadConfig();
+    if (cfg.ssid.empty()) {
+        PrintLog(L"[错误] 尚未配置 SSID，请先执行 --config");
+        return 2;
+    }
+    bool ok = ExecutePosixConnectAndAuth(cfg, false);
+    return ok ? 0 : 1;
+}
+
+int RunPosixApp(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            PrintUsage(argv[0]);
+            return 0;
+        }
+        if (arg == "--connect-once" || arg == "-c") {
+            return RunConnectOnceCli();
+        }
+        if (arg == "--daemon" || arg == "--minimized" || arg == "--tray" || arg == "-d" || arg == "-m") {
+            return RunDaemonLoop();
+        }
+        if (arg == "--status" || arg == "-s") {
+            PrintNetworkStatus();
+            return 0;
+        }
+        if (arg == "--scan") {
+            PrintScanResults();
+            return 0;
+        }
+        if (arg == "--disconnect") {
+            std::wstring msg;
+            bool ok = wifi::Disconnect(msg);
+            PrintLog(msg);
+            return ok ? 0 : 1;
+        }
+        if (arg == "--config") {
+            AppConfig cfg = config::LoadConfig();
+            RunInteractiveConfigWizard(cfg);
+            return 0;
+        }
+    }
+
+    // Interactive Terminal Menu Mode when invoked without arguments
+    while (true) {
+        AppConfig cfg = config::LoadConfig();
+        std::cout << "\n============================================================\n"
+                  << "  AutoWiFi - 自动认证 Wi-Fi 客户端 (802.1X & Captive Portal)\n"
+                  << "============================================================\n"
+                  << "  当前配置 SSID : " << (cfg.ssid.empty() ? "(未设置)" : utils::WideToUtf8(cfg.ssid)) << "\n"
+                  << "  认证方式      : " << AuthModeName(cfg.auth_mode) << "\n"
+                  << "  登录账号      : " << (cfg.username.empty() ? "(未设置)" : utils::WideToUtf8(cfg.username)) << "\n"
+                  << "  Portal 方式   : " << PortalMethodName(cfg.portal_method) << "\n"
+                  << "  开机自启状态  : " << (cfg.auto_start ? "已启用" : "未启用")
+                  << " | 检测间隔: " << cfg.check_interval_sec << " 秒\n"
+                  << "------------------------------------------------------------\n"
+                  << "  [1] 立即连接并认证 (Connect & Auth Now)\n"
+                  << "  [2] 检测当前网络与 Portal 状态 (Check Status)\n"
+                  << "  [3] 扫描周围 Wi-Fi 热点 (Scan Networks)\n"
+                  << "  [4] 配置 Wi-Fi 账号密码与 Portal 参数 (Configure)\n"
+                  << "  [5] 启动后台自动重连监控循环 (Start Monitor Daemon)\n"
+                  << "  [6] 切换开机自动启动 (Toggle Auto-Start)\n"
+                  << "  [7] 断开当前 Wi-Fi 连接 (Disconnect)\n"
+                  << "  [0] 退出程序 (Exit)\n"
+                  << "============================================================\n"
+                  << "请选择操作 [0-7]: " << std::flush;
+
+        std::string choice;
+        if (!std::getline(std::cin, choice)) break;
+        choice = utils::TrimUtf8(choice);
+
+        if (choice == "0" || choice == "q" || choice == "exit") {
+            break;
+        } else if (choice == "1") {
+            ExecutePosixConnectAndAuth(cfg, false);
+        } else if (choice == "2") {
+            PrintNetworkStatus();
+        } else if (choice == "3") {
+            PrintScanResults();
+        } else if (choice == "4") {
+            RunInteractiveConfigWizard(cfg);
+        } else if (choice == "5") {
+            g_posix_running = true;
+            RunDaemonLoop();
+        } else if (choice == "6") {
+            cfg.auto_start = !cfg.auto_start;
+            config::SaveConfig(cfg);
+            PrintLog(cfg.auto_start ? L"[设置] 已开启开机自启" : L"[设置] 已关闭开机自启");
+        } else if (choice == "7") {
+            std::wstring msg;
+            wifi::Disconnect(msg);
+            PrintLog(msg);
+        }
+    }
+    return 0;
+}
+
+#endif

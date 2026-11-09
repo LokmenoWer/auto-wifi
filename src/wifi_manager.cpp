@@ -1,17 +1,24 @@
 #include "wifi_manager.h"
 #include "utils.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <wlanapi.h>
+#else
+#include <unistd.h>
+#include <fstream>
+#endif
 
 #include <algorithm>
 #include <map>
 #include <sstream>
 
 namespace wifi {
+
+#ifdef _WIN32
 
 namespace {
 
@@ -222,7 +229,7 @@ bool WaitUntilConnected(const std::wstring& target_ssid, int timeout_ms) {
     int elapsed = 0;
     const int step = 400;
     while (elapsed < timeout_ms) {
-        Sleep(step);
+        utils::SleepMs(step);
         elapsed += step;
         WifiConnectionState st = GetConnectionState();
         if (st.is_connected && st.current_ssid == target_ssid) {
@@ -289,7 +296,7 @@ std::vector<WifiNetworkInfo> ScanNetworks(bool trigger_active_scan) {
     GUID ifGuid = pIfList->InterfaceInfo[0].InterfaceGuid;
     if (trigger_active_scan) {
         WlanScan(wlan.handle, &ifGuid, nullptr, nullptr, nullptr);
-        Sleep(650);
+        utils::SleepMs(650);
     }
 
     PWLAN_AVAILABLE_NETWORK_LIST pNetList = nullptr;
@@ -527,5 +534,497 @@ bool Disconnect(std::wstring& out_message) {
     out_message = L"断开 Wi-Fi 失败 (错误码 " + std::to_wstring(err) + L")";
     return false;
 }
+
+#elif defined(__APPLE__)  // macOS implementation via networksetup / system_profiler / ipconfig
+
+namespace {
+
+std::string DetectMacWifiInterface() {
+    std::string out = utils::RunCommand("networksetup -listallhardwareports");
+    std::istringstream iss(out);
+    std::string line;
+    bool next_device = false;
+    while (std::getline(iss, line)) {
+        if (line.find("Wi-Fi") != std::string::npos || line.find("AirPort") != std::string::npos) {
+            next_device = true;
+        } else if (next_device && line.find("Device:") != std::string::npos) {
+            size_t pos = line.find("Device:");
+            std::string dev = utils::TrimUtf8(line.substr(pos + 7));
+            if (!dev.empty()) return dev;
+            next_device = false;
+        }
+    }
+    return "en0";
+}
+
+bool WaitUntilConnectedMac(const std::wstring& target_ssid, int timeout_ms) {
+    int elapsed = 0;
+    const int step = 500;
+    while (elapsed < timeout_ms) {
+        utils::SleepMs(step);
+        elapsed += step;
+        WifiConnectionState st = GetConnectionState();
+        if (st.is_connected && (st.current_ssid == target_ssid || st.current_ssid == L"<redacted>")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+WifiConnectionState GetConnectionState() {
+    WifiConnectionState state;
+    std::string ifname = DetectMacWifiInterface();
+    if (ifname.empty()) return state;
+
+    state.has_adapter = true;
+    state.adapter_name = utils::Utf8ToWide(ifname);
+
+    int code = 0;
+    std::string out = utils::RunCommand("networksetup -getairportnetwork " + utils::ShellEscape(ifname), &code);
+    const std::string prefix = "Current Wi-Fi Network:";
+    size_t pos = out.find(prefix);
+    if (pos != std::string::npos) {
+        std::string ssid = utils::TrimUtf8(out.substr(pos + prefix.size()));
+        if (!ssid.empty()) {
+            state.is_connected = true;
+            state.current_ssid = utils::Utf8ToWide(ssid);
+            state.signal_quality = 85;
+            return state;
+        }
+    }
+
+    // Fallback for newer macOS versions where ipconfig getsummary reports active Wi-Fi status
+    std::string summary = utils::RunCommand("ipconfig getsummary " + utils::ShellEscape(ifname), &code);
+    if (summary.find("LinkStatusActive : TRUE") != std::string::npos ||
+        summary.find("InterfaceType : WiFi") != std::string::npos) {
+        size_t s_pos = summary.find("SSID : ");
+        if (s_pos != std::string::npos) {
+            size_t e_pos = summary.find('\n', s_pos);
+            std::string ssid = utils::TrimUtf8(summary.substr(s_pos + 7, e_pos - (s_pos + 7)));
+            if (!ssid.empty() && ssid != "<none>") {
+                state.is_connected = true;
+                state.current_ssid = utils::Utf8ToWide(ssid);
+                state.signal_quality = 85;
+            }
+        }
+    }
+    return state;
+}
+
+std::vector<WifiNetworkInfo> ScanNetworks(bool /*trigger_active_scan*/) {
+    std::vector<WifiNetworkInfo> results;
+    std::map<std::wstring, WifiNetworkInfo> best_by_ssid;
+
+    // Parse system_profiler SPAirPortDataType for Other Local Wi-Fi Networks
+    std::string out = utils::RunCommand("system_profiler SPAirPortDataType");
+    std::istringstream iss(out);
+    std::string line;
+    bool in_networks = false;
+    std::wstring current_ssid;
+    WifiNetworkInfo current_info;
+
+    auto flush_current = [&]() {
+        if (!current_ssid.empty() && current_ssid != L"<redacted>") {
+            auto it = best_by_ssid.find(current_ssid);
+            if (it == best_by_ssid.end() || current_info.signal_quality > it->second.signal_quality) {
+                best_by_ssid[current_ssid] = current_info;
+            }
+        }
+        current_ssid.clear();
+        current_info = WifiNetworkInfo{};
+    };
+
+    while (std::getline(iss, line)) {
+        std::string trimmed = utils::TrimUtf8(line);
+        if (trimmed.empty()) continue;
+
+        if (trimmed == "Other Local Wi-Fi Networks:" || trimmed == "Current Network Information:") {
+            in_networks = true;
+            continue;
+        }
+        if (!in_networks) continue;
+
+        // Indentation level 12 spaces for network name ending with ':'
+        size_t leading_spaces = line.find_first_not_of(' ');
+        if (leading_spaces == 12 && trimmed.back() == ':') {
+            flush_current();
+            std::string ssid_str = trimmed.substr(0, trimmed.size() - 1);
+            current_ssid = utils::Utf8ToWide(ssid_str);
+            current_info.ssid = current_ssid;
+            current_info.signal_quality = 75;
+            current_info.auth_desc = L"Wi-Fi";
+        } else if (!current_ssid.empty() && leading_spaces >= 14) {
+            if (trimmed.rfind("Security:", 0) == 0) {
+                std::string sec = utils::TrimUtf8(trimmed.substr(9));
+                if (sec.find("None") != std::string::npos || sec.find("Open") != std::string::npos) {
+                    current_info.is_secure = false;
+                    current_info.is_8021x = false;
+                    current_info.auth_desc = L"开放网络 (Portal)";
+                } else if (sec.find("Enterprise") != std::string::npos || sec.find("802.1X") != std::string::npos) {
+                    current_info.is_secure = true;
+                    current_info.is_8021x = true;
+                    current_info.auth_desc = L"802.1X 企业认证";
+                } else {
+                    current_info.is_secure = true;
+                    current_info.is_8021x = false;
+                    current_info.auth_desc = utils::Utf8ToWide(sec);
+                }
+            } else if (trimmed.rfind("Signal / Noise:", 0) == 0) {
+                // Example: -55 dBm / -90 dBm
+                size_t dbm_pos = trimmed.find("dBm");
+                if (dbm_pos != std::string::npos) {
+                    std::string rssi_str = utils::TrimUtf8(trimmed.substr(15, dbm_pos - 15));
+                    try {
+                        int rssi = std::stoi(rssi_str);
+                        int qual = std::clamp(2 * (rssi + 100), 5, 100);
+                        current_info.signal_quality = qual;
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+    flush_current();
+
+    for (auto& kv : best_by_ssid) {
+        results.push_back(kv.second);
+    }
+    std::sort(results.begin(), results.end(), [](const WifiNetworkInfo& a, const WifiNetworkInfo& b) {
+        return a.signal_quality > b.signal_quality;
+    });
+    return results;
+}
+
+bool ConnectEnterprise8021X(const std::wstring& ssid,
+                            const std::wstring& username,
+                            const std::wstring& password,
+                            const std::wstring& /*domain*/,
+                            std::wstring& out_message) {
+    if (ssid.empty() || username.empty()) {
+        out_message = L"SSID 与 802.1X 账号不能为空";
+        return false;
+    }
+
+    std::string ifname = DetectMacWifiInterface();
+    std::string ssid_utf8 = utils::WideToUtf8(ssid);
+    std::string pass_utf8 = utils::WideToUtf8(password);
+
+    // Attempt direct association if profile is already installed in macOS Keychain/Profiles
+    int code = 0;
+    std::string cmd = "networksetup -setairportnetwork " + utils::ShellEscape(ifname) + " " +
+                      utils::ShellEscape(ssid_utf8) + " " + utils::ShellEscape(pass_utf8);
+    std::string out = utils::RunCommand(cmd, &code);
+    if (code == 0 && out.find("Failed") == std::string::npos && out.find("Error") == std::string::npos) {
+        if (WaitUntilConnectedMac(ssid, 8000)) {
+            out_message = L"已连接至 [" + ssid + L"]";
+            return true;
+        }
+    }
+
+    // Generate a standard macOS 802.1X PEAP .mobileconfig profile in /tmp for quick installation
+    std::string profile_path = "/tmp/autowifi_8021x_" + std::to_string(getpid()) + ".mobileconfig";
+    std::ofstream ofs(profile_path, std::ios::trunc);
+    if (ofs.is_open()) {
+        std::string esc_ssid = utils::WideToUtf8(utils::EscapeXml(ssid));
+        std::string esc_user = utils::WideToUtf8(utils::EscapeXml(username));
+        std::string esc_pass = utils::WideToUtf8(utils::EscapeXml(password));
+        ofs << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            << "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            << "<plist version=\"1.0\">\n"
+            << "<dict>\n"
+            << "  <key>PayloadContent</key>\n"
+            << "  <array>\n"
+            << "    <dict>\n"
+            << "      <key>AutoJoin</key><true/>\n"
+            << "      <key>EncryptionType</key><string>WPA2</string>\n"
+            << "      <key>SSID_STR</key><string>" << esc_ssid << "</string>\n"
+            << "      <key>EAPClientConfiguration</key>\n"
+            << "      <dict>\n"
+            << "        <key>AcceptEAPTypes</key><array><integer>25</integer></array>\n"
+            << "        <key>EAPFASTUsePAC</key><false/>\n"
+            << "        <key>TTLSInnerAuthentication</key><string>MSCHAPv2</string>\n"
+            << "        <key>UserName</key><string>" << esc_user << "</string>\n"
+            << "        <key>UserPassword</key><string>" << esc_pass << "</string>\n"
+            << "      </dict>\n"
+            << "      <key>PayloadIdentifier</key><string>io.github.autowifi.wifi." << esc_ssid << "</string>\n"
+            << "      <key>PayloadType</key><string>com.apple.wifi.managed</string>\n"
+            << "      <key>PayloadUUID</key><string>11111111-2222-3333-4444-555555555555</string>\n"
+            << "      <key>PayloadVersion</key><integer>1</integer>\n"
+            << "    </dict>\n"
+            << "  </array>\n"
+            << "  <key>PayloadDisplayName</key><string>AutoWiFi 802.1X (" << esc_ssid << ")</string>\n"
+            << "  <key>PayloadIdentifier</key><string>io.github.autowifi.profile</string>\n"
+            << "  <key>PayloadType</key><string>Configuration</string>\n"
+            << "  <key>PayloadUUID</key><string>AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE</string>\n"
+            << "  <key>PayloadVersion</key><integer>1</integer>\n"
+            << "</dict>\n"
+            << "</plist>\n";
+        ofs.close();
+    }
+
+    out_message = L"macOS 802.1X 配置已生成至 " + utils::Utf8ToWide(profile_path) +
+                  L" (可双击导入系统配置描述文件，或使用 networksetup 连接)";
+    return false;
+}
+
+bool ConnectOpenOrPsk(const std::wstring& ssid,
+                      const std::wstring& psk,
+                      bool is_open,
+                      std::wstring& out_message) {
+    if (ssid.empty()) {
+        out_message = L"SSID 不能为空";
+        return false;
+    }
+
+    std::string ifname = DetectMacWifiInterface();
+    std::string cmd = "networksetup -setairportnetwork " + utils::ShellEscape(ifname) + " " +
+                      utils::ShellEscape(utils::WideToUtf8(ssid));
+    if (!is_open && !psk.empty()) {
+        cmd += " " + utils::ShellEscape(utils::WideToUtf8(psk));
+    }
+
+    int code = 0;
+    std::string out = utils::RunCommand(cmd, &code);
+    if (code == 0 && out.find("Failed") == std::string::npos && out.find("Could not") == std::string::npos) {
+        if (WaitUntilConnectedMac(ssid, 8000)) {
+            out_message = L"已成功关联至热点 [" + ssid + L"]";
+            return true;
+        }
+        out_message = L"已发送关联指令至 [" + ssid + L"]";
+        return true;
+    }
+
+    out_message = L"macOS 关联热点失败: " + utils::Trim(utils::Utf8ToWide(out));
+    return false;
+}
+
+bool Disconnect(std::wstring& out_message) {
+    std::string ifname = DetectMacWifiInterface();
+    int code = 0;
+    utils::RunCommand("networksetup -setairportpower " + utils::ShellEscape(ifname) + " off", &code);
+    utils::SleepMs(500);
+    utils::RunCommand("networksetup -setairportpower " + utils::ShellEscape(ifname) + " on", &code);
+    if (code == 0) {
+        out_message = L"已重置无线网卡 [" + utils::Utf8ToWide(ifname) + L"] 并断开当前连接";
+        return true;
+    }
+    out_message = L"断开 Wi-Fi 失败";
+    return false;
+}
+
+#else  // Linux implementation via NetworkManager (nmcli)
+
+namespace {
+
+std::string DetectLinuxWifiInterface() {
+    std::string out = utils::RunCommand("nmcli -t -f DEVICE,TYPE device");
+    std::istringstream iss(out);
+    std::string line;
+    while (std::getline(iss, line)) {
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string dev = line.substr(0, colon);
+            std::string type = utils::TrimUtf8(line.substr(colon + 1));
+            if (type == "wifi") return dev;
+        }
+    }
+    return "";
+}
+
+}  // namespace
+
+WifiConnectionState GetConnectionState() {
+    WifiConnectionState state;
+    std::string ifname = DetectLinuxWifiInterface();
+    if (ifname.empty()) return state;
+
+    state.has_adapter = true;
+    state.adapter_name = utils::Utf8ToWide(ifname);
+
+    std::string out = utils::RunCommand("nmcli -t -f ACTIVE,SSID,SIGNAL dev wifi");
+    std::istringstream iss(out);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.rfind("yes:", 0) == 0) {
+            std::string rest = line.substr(4);
+            size_t last_colon = rest.rfind(':');
+            if (last_colon != std::string::npos) {
+                std::string ssid = rest.substr(0, last_colon);
+                std::string sig = utils::TrimUtf8(rest.substr(last_colon + 1));
+                state.is_connected = true;
+                state.current_ssid = utils::Utf8ToWide(ssid);
+                try {
+                    state.signal_quality = std::stoi(sig);
+                } catch (...) {
+                    state.signal_quality = 80;
+                }
+                break;
+            }
+        }
+    }
+    return state;
+}
+
+std::vector<WifiNetworkInfo> ScanNetworks(bool trigger_active_scan) {
+    std::vector<WifiNetworkInfo> results;
+    std::string rescan_flag = trigger_active_scan ? "--rescan yes" : "--rescan auto";
+    std::string out = utils::RunCommand("nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list " + rescan_flag);
+
+    std::map<std::wstring, WifiNetworkInfo> best_by_ssid;
+    std::istringstream iss(out);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::string trimmed = utils::TrimUtf8(line);
+        if (trimmed.empty()) continue;
+
+        size_t last_colon = trimmed.rfind(':');
+        if (last_colon == std::string::npos || last_colon == 0) continue;
+        size_t mid_colon = trimmed.rfind(':', last_colon - 1);
+        if (mid_colon == std::string::npos) continue;
+
+        std::string ssid_utf8 = trimmed.substr(0, mid_colon);
+        std::string sig_str = trimmed.substr(mid_colon + 1, last_colon - mid_colon - 1);
+        std::string sec_str = trimmed.substr(last_colon + 1);
+
+        if (ssid_utf8.empty()) continue;
+        std::wstring ssid = utils::Utf8ToWide(ssid_utf8);
+
+        WifiNetworkInfo info;
+        info.ssid = ssid;
+        try {
+            info.signal_quality = std::stoi(sig_str);
+        } catch (...) {
+            info.signal_quality = 50;
+        }
+
+        if (sec_str.empty() || sec_str == "--") {
+            info.is_secure = false;
+            info.is_8021x = false;
+            info.auth_desc = L"开放网络 (Portal)";
+        } else if (sec_str.find("802.1X") != std::string::npos) {
+            info.is_secure = true;
+            info.is_8021x = true;
+            info.auth_desc = L"802.1X 企业认证";
+        } else {
+            info.is_secure = true;
+            info.is_8021x = false;
+            info.auth_desc = utils::Utf8ToWide(sec_str);
+        }
+
+        auto it = best_by_ssid.find(ssid);
+        if (it == best_by_ssid.end() || info.signal_quality > it->second.signal_quality) {
+            best_by_ssid[ssid] = info;
+        }
+    }
+
+    for (auto& kv : best_by_ssid) {
+        results.push_back(kv.second);
+    }
+    std::sort(results.begin(), results.end(), [](const WifiNetworkInfo& a, const WifiNetworkInfo& b) {
+        return a.signal_quality > b.signal_quality;
+    });
+    return results;
+}
+
+bool ConnectEnterprise8021X(const std::wstring& ssid,
+                            const std::wstring& username,
+                            const std::wstring& password,
+                            const std::wstring& domain,
+                            std::wstring& out_message) {
+    if (ssid.empty() || username.empty()) {
+        out_message = L"SSID 与 802.1X 认证账号不能为空";
+        return false;
+    }
+
+    std::string ifname = DetectLinuxWifiInterface();
+    if (ifname.empty()) {
+        out_message = L"未检测到可用的 Linux 无线网卡接口 (nmcli)";
+        return false;
+    }
+
+    std::string ssid_utf8 = utils::WideToUtf8(ssid);
+    std::string con_name = "AutoWiFi-" + ssid_utf8;
+
+    // Delete any existing connection profile with the same name first
+    utils::RunCommand("nmcli connection delete " + utils::ShellEscape(con_name));
+
+    std::string cmd = "nmcli connection add type wifi ifname " + utils::ShellEscape(ifname) +
+                      " con-name " + utils::ShellEscape(con_name) +
+                      " ssid " + utils::ShellEscape(ssid_utf8) +
+                      " wifi-sec.key-mgmt wpa-eap" +
+                      " 802-1x.eap peap" +
+                      " 802-1x.phase2-auth mschapv2" +
+                      " 802-1x.identity " + utils::ShellEscape(utils::WideToUtf8(username)) +
+                      " 802-1x.password " + utils::ShellEscape(utils::WideToUtf8(password));
+    if (!domain.empty()) {
+        cmd += " 802-1x.domain-suffix-match " + utils::ShellEscape(utils::WideToUtf8(domain));
+    }
+
+    int code = 0;
+    std::string out = utils::RunCommand(cmd, &code);
+    if (code != 0) {
+        out_message = L"创建 NetworkManager 802.1X 配置失败: " + utils::Trim(utils::Utf8ToWide(out));
+        return false;
+    }
+
+    out = utils::RunCommand("nmcli connection up " + utils::ShellEscape(con_name), &code);
+    if (code == 0) {
+        out_message = L"已成功通过 802.1X 认证并连接至 [" + ssid + L"]";
+        return true;
+    }
+
+    out_message = L"激活 802.1X 连接失败: " + utils::Trim(utils::Utf8ToWide(out));
+    return false;
+}
+
+bool ConnectOpenOrPsk(const std::wstring& ssid,
+                      const std::wstring& psk,
+                      bool is_open,
+                      std::wstring& out_message) {
+    if (ssid.empty()) {
+        out_message = L"SSID 不能为空";
+        return false;
+    }
+
+    WifiConnectionState cur = GetConnectionState();
+    if (cur.is_connected && cur.current_ssid == ssid) {
+        out_message = L"当前已连接至 Wi-Fi [" + ssid + L"]";
+        return true;
+    }
+
+    std::string cmd = "nmcli device wifi connect " + utils::ShellEscape(utils::WideToUtf8(ssid));
+    if (!is_open && !psk.empty()) {
+        cmd += " password " + utils::ShellEscape(utils::WideToUtf8(psk));
+    }
+
+    int code = 0;
+    std::string out = utils::RunCommand(cmd, &code);
+    if (code == 0) {
+        out_message = L"已成功关联至热点 [" + ssid + L"]";
+        return true;
+    }
+
+    out_message = L"关联热点失败: " + utils::Trim(utils::Utf8ToWide(out));
+    return false;
+}
+
+bool Disconnect(std::wstring& out_message) {
+    std::string ifname = DetectLinuxWifiInterface();
+    if (ifname.empty()) {
+        out_message = L"未检测到可用的无线网卡接口";
+        return false;
+    }
+    int code = 0;
+    std::string out = utils::RunCommand("nmcli device disconnect " + utils::ShellEscape(ifname), &code);
+    if (code == 0) {
+        out_message = L"已断开当前 Wi-Fi 连接";
+        return true;
+    }
+    out_message = L"断开 Wi-Fi 失败: " + utils::Trim(utils::Utf8ToWide(out));
+    return false;
+}
+
+#endif
 
 }  // namespace wifi

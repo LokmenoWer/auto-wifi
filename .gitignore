@@ -1,5 +1,6 @@
 # Build directory
 build/
+build-*/
 cmake-build-*/
 
 # OS & Editor files

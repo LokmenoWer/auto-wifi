@@ -1,11 +1,12 @@
 #include "gui.h"
 
+#ifdef _WIN32
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <shellapi.h>
-
 #include <string>
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pCmdLine*/, int /*nCmdShow*/) {
@@ -17,7 +18,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
     if (argv) {
         for (int i = 1; i < argc; ++i) {
             std::wstring arg = argv[i];
-            if (arg == L"--minimized" || arg == L"--tray" || arg == L"-m") {
+            if (arg == L"--minimized" || arg == L"--tray" || arg == L"--daemon" || arg == L"-m" || arg == L"-d") {
                 start_minimized = true;
             } else if (arg == L"--connect-once" || arg == L"-c") {
                 connect_once = true;
@@ -51,3 +52,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
     }
     return ret;
 }
+
+#else
+
+int main(int argc, char* argv[]) {
+    return RunPosixApp(argc, argv);
+}
+
+#endif
